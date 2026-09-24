@@ -1,7 +1,32 @@
 <!DOCTYPE html>
 <!--
   ============================================================================
-  CIC-G2 · BUILD 2026-09-24b
+  CIC-G2 · BUILD 2026-09-24c
+  Build 2026-09-24c: UPGRADE DE EGRESS DO SUPABASE (mudanca de TRANSPORTE, nenhum numero muda).
+  Medido: ~340 GB/mes projetados contra cota de 250 GB (Spend Cap ligado), 94% vindo do
+  unnichat_events_crm rebaixado inteiro (~22 MB) a cada refresh/alt-tab/F5.
+  (A) eventos INCREMENTAL por id: 1a carga completa; refresh busca so id > maior_id_local, insere
+  na ordem data,hora,id (espelha o ORDER BY do Postgres, NULL por ultimo) e o processarEventos
+  recebe o MESMO CSV de antes (so com a coluna id no fim). Guarda as linhas cruas, nao arrays.
+  (A2) trava: HEAD count=exact de id <= maior_id_local; divergiu = carga completa (1 vez).
+  ATENCAO: a trava nao detecta UPDATE; so vale porque a tabela e append-only (0 upd/0 del).
+  Uma carga de eventos por vez (evita duplicar linhas com refresh concorrente).
+  (B) IndexedDB por TENANT_ID (eventos, 3 views de venda com hash, views de MV), validade de
+  7 dias desde a ultima carga completa; qualquer falha do IndexedDB = comportamento antigo.
+  (ii) RPC cic_assinatura_fontes() (md5 de vw_dash_vendas/tmb/reembolso, ~190 bytes, ~0,3-0,4 s):
+  so rebaixa a view cujo hash mudou; RPC falhou = baixa como antes.
+  (MV) vw_dash_perda_etapa vale ate o proximo HH:09 (cron :07); vw_dash_ciclo_venda/perda ate o
+  proximo HH:18 (cadeia :12/:14/:16). F5 antes do corte nao rebaixa.
+  (D) auto-refresh pausa apos 15 min sem mouse/teclado/clique/scroll/toque (status mostra
+  "Pausado (inativo)"); atividade retoma e atualiza se o ultimo load tem >5 min. Voltar pra aba
+  e o refresh de 5 min passam a ser incrementais. carregarDados(true) (parametro que nao fazia
+  nada) vira carregarDados({completa}).
+  Botao Atualizar (os dois): clique = incremental; Shift+clique = recarga completa de eventos,
+  vendas/TMB/reembolso, Motivos de Perda e Ciclo (limpa memoria + IndexedDB do tenant).
+  Discadora, Callix da Home e Meta do Mes seguem com o TTL de 5 min delas (fora do escopo).
+  Validado no dash vivo antes do deploy: CSV novo x antigo identico (138.603 linhas), hash do
+  processarEventos identico, incremental com 300 linhas tiradas (11 no meio da ordem) == carga
+  completa, trava dispara 1 vez e volta ao incremental.
   Build 2026-09-24b — Ajuste na build anterior: as 3 linhas de meta do grafico Variacao
   de Vendas por Hora deixam de ser ACUMULADAS e viram taxa CONSTANTE de vendas/hora
   (vendasDia/15, mesma reta em todas as horas) — compara direto com a barra do Total,
@@ -1298,7 +1323,7 @@ h1 span{background:linear-gradient(90deg,var(--accent),#a3b5ff);-webkit-backgrou
   <div class="error-banner" id="errorBanner"></div>
   <div id="sourceStatus" style="display:none;align-items:center;gap:12px;flex-wrap:wrap;font-family:'JetBrains Mono',monospace;font-size:12px;padding:8px 12px;margin-bottom:10px;border-radius:8px;background:var(--card,#fff);border:1px solid var(--border,#e5e7eb)">
     <span id="sourceStatusText" style="color:var(--muted)"></span>
-    <button onclick="carregarDados(true)" class="header-btn" style="margin-left:auto" title="Buscar dados agora">🔄 Atualizar agora</button>
+    <button onclick="cicAtualizarClique(event)" class="header-btn" style="margin-left:auto" title="Buscar dados agora (Shift+clique força recarga completa)">🔄 Atualizar agora</button>
   </div>
   <div class="header">
     <div class="brand">
@@ -1309,7 +1334,7 @@ h1 span{background:linear-gradient(90deg,var(--accent),#a3b5ff);-webkit-backgrou
       <div class="update-info">
         <span class="live-dot" id="liveDot"></span>
         <span id="updateStatus">Atualizado às <span id="updateTime">--:--</span></span>
-        <button id="refreshBtn" onclick="carregarDados(true)" class="header-btn" title="Atualizar dados">🔄</button>
+        <button id="refreshBtn" onclick="cicAtualizarClique(event)" class="header-btn" title="Atualizar (Shift+clique força recarga completa)">🔄</button>
         <button id="themeToggle" onclick="toggleTheme()" class="header-btn theme-btn" title="Alternar tema claro/escuro">🌙</button>
       </div>
       <div class="flt-bar" id="fltBar">
@@ -6603,10 +6628,11 @@ function parseValorBR(v){
 
 // Busca e processa a base de reembolsos (todos os meses). Usada tanto no carregamento
 // principal (pra abater do faturamento) quanto pela aba.
-async function fetchReembolsos(){
+async function fetchReembolsos(completa){
   // Fonte migrada para o Supabase (view vw_dash_reembolso). O CSV retornado tem os
   // mesmos cabeçalhos que processarReembolsos espera. REEMBOLSOS_CSV_URL fica como legado.
-  const txt = await fetchReembolsosSupabase();
+  // (build 09-24c) passa por cicViewComCache: só rebaixa se o hash da view mudou.
+  const txt = await fetchReembolsosSupabase(completa);
   REEMBOLSOS_DADOS = processarReembolsos(txt);
   REEMBOLSOS_AT = Date.now();
   return REEMBOLSOS_DADOS;
@@ -7973,49 +7999,250 @@ async function fetchViewCsvSupabase(viewName){
   console.log('[Supabase] ' + viewName + ': ' + linhas.length + ' linhas (paginado)');
   return header + '\n' + linhas.join('\n');
 }
-async function fetchVendasSupabase(){     return fetchViewCsvSupabase('vw_dash_vendas'); }
-async function fetchTMBSupabase(){        return fetchViewCsvSupabase('vw_dash_tmb'); }
-async function fetchReembolsosSupabase(){ return fetchViewCsvSupabase('vw_dash_reembolso'); }
+// ----- Views de venda com assinatura (regras ii + B) -----
+// cic_assinatura_fontes() devolve o md5 do conteúdo de vw_dash_vendas/tmb/reembolso (~190 bytes).
+// Só rebaixa a view cujo hash mudou. Se o RPC falhar, baixa como antes: nunca quebra o dash.
+const CIC_VIEW_SCHEMA = 'v1';
+const CIC_VIEW_CACHE = {};                    // fonte -> { versaoSchema, texto, hash, cargaCompletaEm }
+let __cicAss = { at: 0, val: null, p: null };
+async function cicAssinatura(forcar){
+  if(__cicAss.p) return __cicAss.p;
+  if(!forcar && __cicAss.at && (Date.now() - __cicAss.at) < 60000) return __cicAss.val;   // 1 chamada por minuto no máximo
+  __cicAss.p = (async () => {
+    let val = null;
+    try {
+      const key = SUPABASE_EVENTOS.anonKey;
+      const r = await fetch(SUPABASE_BASE + '/rest/v1/rpc/cic_assinatura_fontes', { method: 'POST',
+        headers: { 'apikey': key, 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' }, body: '{}' });
+      if(!r.ok) throw new Error('HTTP ' + r.status);
+      val = await r.json();
+    } catch(e){ console.warn('[Cache] assinatura indisponível, baixando as views como antes:', e && e.message); val = null; }
+    __cicAss = { at: Date.now(), val: val, p: null };
+    return val;
+  })();
+  return __cicAss.p;
+}
+async function cicViewComCache(fonte, view, completa){
+  const ass = await cicAssinatura(completa);
+  const hash = (ass && ass[fonte]) ? ass[fonte] : null;
+  if(hash && !completa){
+    let c = CIC_VIEW_CACHE[fonte];
+    if(!c){ c = await cicIdbLer('view_' + fonte); if(c) CIC_VIEW_CACHE[fonte] = c; }
+    if(c && c.hash === hash && c.versaoSchema === CIC_VIEW_SCHEMA && typeof c.texto === 'string'
+       && (Date.now() - c.cargaCompletaEm) < CIC_CACHE_MAX_MS && c.cargaCompletaEm > window.CIC_FORCADO_EM){
+      console.log('[Cache] ' + view + ': sem mudança (hash), sem download');
+      return c.texto;
+    }
+  }
+  const texto = await fetchViewCsvSupabase(view);
+  const reg = { versaoSchema: CIC_VIEW_SCHEMA, texto: texto, hash: hash, cargaCompletaEm: Date.now() };
+  CIC_VIEW_CACHE[fonte] = reg;
+  if(hash) cicIdbGravar('view_' + fonte, reg);
+  return texto;
+}
+async function fetchVendasSupabase(completa){     return cicViewComCache('vendas',    'vw_dash_vendas',    completa); }
+async function fetchTMBSupabase(completa){        return cicViewComCache('tmb',       'vw_dash_tmb',       completa); }
+async function fetchReembolsosSupabase(completa){ return cicViewComCache('reembolso', 'vw_dash_reembolso', completa); }
 
-async function fetchEventosSupabase(){
-  const PAGE = 1000;              // limite do PostgREST por requisição
-  const MAX_PAGINAS = 200;       // teto de segurança (200 mil linhas)
-  // Egress: buscamos só as ~12 colunas que o funil usa, e em CSV (não JSON) — o JSON
-  // repetiria os nomes das 22 colunas em cada uma das ~77k linhas. id fica fora do select
-  // mas ainda entra no order (desempate de paginação: evita repetir/pular linhas).
-  const COLS = 'data,hora,email,nome,telefone,acao,origem,status,proprietario,pipeline,etapa_crm,motivo_perda';
+// ----- Views sobre materialized view (regra MV + B) -----
+// O conteúdo só muda quando o pg_cron roda. Cache vale até logo depois do próximo refresh:
+// perda_etapa: cron no :07 -> corte no :09. Ciclo: cadeia :12/:14/:16 -> corte no :18.
+window.cicMvFresco = function(ts, minutoCorte){
+  if(!ts || !(ts > window.CIC_FORCADO_EM)) return false;
+  const agora = new Date();
+  const corte = new Date(agora); corte.setMinutes(minutoCorte, 0, 0);
+  if(corte > agora) corte.setHours(corte.getHours() - 1);   // último corte que já passou
+  return ts >= corte.getTime();
+};
+// Devolve { csv, at } do IndexedDB se ainda fresco pela regra acima; senão baixa e grava.
+window.cicMvCsv = async function(chave, view, minutoCorte){
+  const c = await cicIdbLer('mv_' + chave);
+  if(c && typeof c.csv === 'string' && window.cicMvFresco(c.at, minutoCorte)){
+    console.log('[Cache] ' + view + ': IndexedDB (antes do corte HH:' + String(minutoCorte).padStart(2,'0') + '), sem download');
+    return { csv: c.csv, at: c.at };
+  }
+  const csv = await fetchViewCsvSupabase(view);
+  const at = Date.now();
+  cicIdbGravar('mv_' + chave, { csv: csv, at: at });
+  return { csv: csv, at: at };
+};
+
+// ===========================================================================
+// UPGRADE EGRESS (build 2026-09-24c): cache persistente + eventos incremental
+// + views de venda por assinatura. Mudança de TRANSPORTE, não de régua: o que
+// chega no processarEventos/processarCSV/processarTMB/processarReembolsos é o
+// mesmo texto de antes (eventos ganha só a coluna id no fim).
+// ===========================================================================
+
+// ----- Cache persistente (IndexedDB). Tudo em try/catch: se falhar (aba anônima,
+// cota, bloqueio), o dash funciona como antes (carga completa), sem erro na tela.
+const CIC_IDB = { nome: 'cic-g2-cache', versao: 1, store: 'fontes' };
+const CIC_CACHE_MAX_MS = 7 * 24 * 3600 * 1000;   // 7 dias corridos desde a última carga COMPLETA
+let __cicIdbDb = null;
+function cicIdbAbrir(){
+  if(__cicIdbDb) return __cicIdbDb;
+  __cicIdbDb = new Promise((ok, falha) => {
+    try {
+      const req = indexedDB.open(CIC_IDB.nome, CIC_IDB.versao);
+      req.onupgradeneeded = () => { const db = req.result; if(!db.objectStoreNames.contains(CIC_IDB.store)) db.createObjectStore(CIC_IDB.store); };
+      req.onsuccess = () => ok(req.result);
+      req.onerror = () => falha(req.error);
+      req.onblocked = () => falha(new Error('IndexedDB bloqueado'));
+    } catch(e){ falha(e); }
+  });
+  return __cicIdbDb;
+}
+async function cicIdbLer(chave){
+  try { const db = await cicIdbAbrir();
+    return await new Promise(ok => { const r = db.transaction(CIC_IDB.store).objectStore(CIC_IDB.store).get(TENANT_ID + ':' + chave);
+      r.onsuccess = () => ok(r.result || null); r.onerror = () => ok(null); });
+  } catch(e){ console.warn('[Cache] IndexedDB indisponível (leitura):', e && e.message); return null; }
+}
+async function cicIdbGravar(chave, valor){
+  try { const db = await cicIdbAbrir();
+    await new Promise(ok => { const tx = db.transaction(CIC_IDB.store, 'readwrite');
+      tx.objectStore(CIC_IDB.store).put(valor, TENANT_ID + ':' + chave); tx.oncomplete = ok; tx.onerror = ok; tx.onabort = ok; });
+  } catch(e){ console.warn('[Cache] IndexedDB indisponível (gravação):', e && e.message); }
+}
+// Shift+clique no Atualizar: apaga as chaves deste TENANT_ID.
+async function cicIdbLimparTudo(){
+  try { const db = await cicIdbAbrir(); const pref = TENANT_ID + ':';
+    await new Promise(ok => { const tx = db.transaction(CIC_IDB.store, 'readwrite'); const st = tx.objectStore(CIC_IDB.store);
+      const r = st.openKeyCursor();
+      r.onsuccess = () => { const c = r.result; if(!c) return; if(String(c.key).indexOf(pref) === 0) st.delete(c.key); c.continue(); };
+      tx.oncomplete = ok; tx.onerror = ok; tx.onabort = ok; });
+  } catch(e){ console.warn('[Cache] IndexedDB indisponível (limpeza):', e && e.message); }
+}
+// Carimbo do último Shift+clique: qualquer cache (memória ou IndexedDB) mais velho que isso é descartado.
+window.CIC_FORCADO_EM = 0;
+
+// ----- EVENTOS incremental por id (regras A + A2 + B) -----
+// Estado: { versaoSchema, header, linhas:[linha CSV crua], maxId, total, cargaCompletaEm }.
+// Guardamos as LINHAS CRUAS (não arrays parseados): ~3x menos memória por aba, e o
+// processarEventos recebe exatamente o mesmo CSV de antes (só com o id no fim).
+// ATENÇÃO: a trava por contagem NÃO detecta UPDATE. Só vale porque unnichat_events_crm
+// é append-only (0 updates/0 deletes em 24/09/2026). Se virar upsert, trocar o cursor.
+const EV_COLS = 'data,hora,email,nome,telefone,acao,origem,status,proprietario,pipeline,etapa_crm,motivo_perda,id';
+let EV_ESTADO = null;
+let __evEmAndamento = null;
+
+// Chave de ordenação espelhando order=data.asc,hora.asc,id.asc do Postgres.
+// data (date) e hora (time) nunca vêm entre aspas no CSV; id é o último campo.
+function evChave(l){
+  const a = l.indexOf(','), b = l.indexOf(',', a + 1);
+  return { d: l.slice(0, a), h: l.slice(a + 1, b), id: Number(l.slice(l.lastIndexOf(',') + 1)) };
+}
+function evCmp(x, y){
+  if(x.d !== y.d){ if(x.d === '') return 1; if(y.d === '') return -1; return x.d < y.d ? -1 : 1; } // NULL por último
+  if(x.h !== y.h){ if(x.h === '') return 1; if(y.h === '') return -1; return x.h < y.h ? -1 : 1; }
+  return x.id - y.id;
+}
+// Insere mantendo a ordem (busca binária; entram poucas linhas por refresh).
+function evInserirOrdenado(linhas, nova){
+  const k = evChave(nova); let lo = 0, hi = linhas.length;
+  while(lo < hi){ const m = (lo + hi) >> 1; if(evCmp(evChave(linhas[m]), k) <= 0) lo = m + 1; else hi = m; }
+  linhas.splice(lo, 0, nova);
+}
+// Baixa paginado (Range de 1000), mesmo formato de antes. `quebra` = alguma linha com
+// aspas ímpares (campo com quebra de linha): aí o incremental por linha não é seguro.
+async function evBaixar(filtro, ordem){
+  const PAGE = 1000, MAX_PAGINAS = 200;
   const key = SUPABASE_EVENTOS.anonKey;
-  let header = null; const linhas = [];
+  let header = null, quebra = false; const linhas = [];
   for(let p = 0; p < MAX_PAGINAS; p++){
     const de = p * PAGE, ate = de + PAGE - 1;
-    const url = SUPABASE_EVENTOS.url + '?select=' + COLS + '&order=data.asc,hora.asc,id.asc';
-    const resp = await fetch(url, {
-      headers: {
-        'apikey': key,
-        'Authorization': 'Bearer ' + key,
-        'Accept': 'text/csv',
-        'Range-Unit': 'items',
-        'Range': de + '-' + ate
-      }
-    });
+    const url = SUPABASE_EVENTOS.url + '?select=' + EV_COLS + filtro + '&order=' + ordem;
+    const resp = await fetch(url, { headers: { 'apikey': key, 'Authorization': 'Bearer ' + key,
+      'Accept': 'text/csv', 'Range-Unit': 'items', 'Range': de + '-' + ate } });
     if(!resp.ok && resp.status !== 206) throw new Error('Supabase HTTP ' + resp.status + ' (eventos)');
     const txt = await resp.text();
     const partes = txt.split(/\r?\n/);
     while(partes.length && partes[partes.length-1] === '') partes.pop();
     if(partes.length === 0) break;
-    if(p === 0){
-      header = partes[0];
-      for(let k = 1; k < partes.length; k++) linhas.push(partes[k]);
-      if(partes.length - 1 < PAGE) break;
-    } else {
-      const dados = partes.slice(1);
-      for(const l of dados) linhas.push(l);
-      if(dados.length < PAGE) break;
+    if(header === null) header = partes[0];
+    const dados = partes.slice(1);
+    for(const l of dados){ linhas.push(l); if(!quebra && l.indexOf('"') >= 0 && (l.split('"').length % 2) === 0) quebra = true; }
+    if(dados.length < PAGE) break;
+  }
+  return { header, linhas, quebra };
+}
+// Trava A2: quantas linhas existem com id <= maxId (HEAD, sem corpo).
+async function evContarAte(maxId){
+  const key = SUPABASE_EVENTOS.anonKey;
+  const resp = await fetch(SUPABASE_EVENTOS.url + '?select=id&id=lte.' + maxId, { method: 'HEAD',
+    headers: { 'apikey': key, 'Authorization': 'Bearer ' + key, 'Prefer': 'count=exact', 'Range-Unit': 'items', 'Range': '0-0' } });
+  if(!resp.ok && resp.status !== 206) throw new Error('HTTP ' + resp.status);
+  const cr = resp.headers.get('content-range') || '';
+  const n = parseInt(cr.split('/')[1], 10);
+  if(!isFinite(n)) throw new Error('Content-Range ilegível: "' + cr + '"');
+  return n;
+}
+function evMaxId(linhas){ let m = 0; for(const l of linhas){ const v = Number(l.slice(l.lastIndexOf(',') + 1)); if(v > m) m = v; } return m; }
+function evMontar(){ return EV_ESTADO.header + '\n' + EV_ESTADO.linhas.join('\n'); } // processarEventos aceita CSV
+
+async function evCarregar(completa){
+  if(completa) EV_ESTADO = null;
+  // Sem estado em memória: tenta o IndexedDB.
+  if(!EV_ESTADO && !completa){
+    const c = await cicIdbLer('eventos');
+    if(c && Array.isArray(c.linhas) && c.header) EV_ESTADO = c;
+  }
+  if(EV_ESTADO && (EV_ESTADO.versaoSchema !== EV_COLS
+      || !(Date.now() - EV_ESTADO.cargaCompletaEm < CIC_CACHE_MAX_MS)
+      || !(EV_ESTADO.cargaCompletaEm > window.CIC_FORCADO_EM))){
+    console.log('[Eventos] cache vencido ou de outro schema, carga completa');
+    EV_ESTADO = null;
+  }
+  if(EV_ESTADO){
+    let totalBanco = null;
+    try { totalBanco = await evContarAte(EV_ESTADO.maxId); }
+    catch(e){ console.warn('[Eventos] trava: falha na contagem (' + (e && e.message) + '), carga completa'); }
+    if(totalBanco !== EV_ESTADO.total){
+      if(totalBanco !== null) console.warn('[Eventos] trava: divergência ' + totalBanco + ' vs ' + EV_ESTADO.total + ', carga completa');
+      EV_ESTADO = null;
     }
   }
-  console.log('[Eventos] Supabase (CSV, colunas enxutas): total de', linhas.length, 'registros (paginado)');
-  if(header === null) return '';
-  return header + '\n' + linhas.join('\n');   // processarEventos aceita CSV (string) ou rows (array)
+  if(EV_ESTADO){
+    const novo = await evBaixar('&id=gt.' + EV_ESTADO.maxId, 'id.asc');
+    if(novo.quebra || (novo.header !== null && novo.header !== EV_ESTADO.header)){
+      console.warn('[Eventos] incremental inseguro (quebra de linha em campo ou cabeçalho mudou), carga completa');
+      EV_ESTADO = null;
+    } else {
+      for(const l of novo.linhas) evInserirOrdenado(EV_ESTADO.linhas, l);
+      if(novo.linhas.length){
+        EV_ESTADO.maxId = Math.max(EV_ESTADO.maxId, evMaxId(novo.linhas));
+        EV_ESTADO.total = EV_ESTADO.linhas.length;
+        cicIdbGravar('eventos', EV_ESTADO);          // só regrava quando entrou linha
+      }
+      console.log('[Eventos] incremental: +' + novo.linhas.length + ' linhas (total ' + EV_ESTADO.total + ')');
+      return evMontar();
+    }
+  }
+  // Carga completa (igual à de antes, com o id no fim).
+  const tudo = await evBaixar('', 'data.asc,hora.asc,id.asc');
+  console.log('[Eventos] completa: ' + tudo.linhas.length + ' linhas');
+  if(tudo.header === null){ EV_ESTADO = null; return ''; }
+  const est = { versaoSchema: EV_COLS, header: tudo.header, linhas: tudo.linhas,
+                maxId: evMaxId(tudo.linhas), total: tudo.linhas.length, cargaCompletaEm: Date.now() };
+  if(tudo.quebra){
+    console.warn('[Eventos] campo com quebra de linha: sem cache incremental nesta carga');
+    EV_ESTADO = null;
+    return est.header + '\n' + est.linhas.join('\n');
+  }
+  EV_ESTADO = est;
+  cicIdbGravar('eventos', EV_ESTADO);
+  return evMontar();
+}
+// Uma carga por vez: duas cargas simultâneas acrescentariam as mesmas linhas.
+async function fetchEventosSupabase(opts){
+  const completa = !!(opts && opts.completa === true);
+  if(__evEmAndamento){
+    if(!completa) return __evEmAndamento;
+    try { await __evEmAndamento; } catch(e){}
+  }
+  const p = evCarregar(completa);
+  __evEmAndamento = p;
+  try { return await p; } finally { if(__evEmAndamento === p) __evEmAndamento = null; }
 }
 
 // Converte [{col:val,...}, ...] em [[header...], [val...], ...]
@@ -8462,7 +8689,10 @@ function calcularFunil(){
   return out;
 }
 
-async function carregarDados(forceRefresh = false){
+// (build 09-24c) carregarDados({completa}): completa:true só no Shift+clique do Atualizar.
+// O antigo carregarDados(true) não fazia nada com o parâmetro (toda carga era completa).
+async function carregarDados(opts){
+  const completa = !!(opts && opts.completa === true);
   const dot = document.getElementById('liveDot');
   const status = document.getElementById('updateStatus');
   const btn = document.getElementById('refreshBtn');
@@ -8477,7 +8707,7 @@ async function carregarDados(forceRefresh = false){
 
   try {
     // ===== VENDAS (Hubla) — view vw_dash_vendas =====
-    const text = await fetchVendasSupabase();
+    const text = await fetchVendasSupabase(completa);
     console.log('[Dashboard] CSV vendas recebido. Tamanho:', text.length, 'chars.');
     const novosDados = processarCSV(text);
     marcarFonte('vendas', true);
@@ -8486,7 +8716,7 @@ async function carregarDados(forceRefresh = false){
 
     // ===== TMB (boleto parcelado) — view vw_dash_tmb. Não bloqueia o dash se falhar. =====
     try {
-      const textTmb = await fetchTMBSupabase();
+      const textTmb = await fetchTMBSupabase(completa);
       console.log('[TMB] CSV recebido. Tamanho:', textTmb.length);
       processarTMB(textTmb, novosDados);
       marcarFonte('tmb', true);
@@ -8497,7 +8727,7 @@ async function carregarDados(forceRefresh = false){
 
     // ===== REEMBOLSOS — view vw_dash_reembolso. Se falhar, faturamento fica BRUTO. =====
     try {
-      await fetchReembolsos();
+      await fetchReembolsos(completa);
       aplicarReembolsos(novosDados);
       marcarFonte('reembolsos', true);
       console.log('[Reembolsos] Aplicado.', MES_CORRENTE + ':', (novosDados[MES_CORRENTE]||{}).reembolsos);
@@ -8511,7 +8741,7 @@ async function carregarDados(forceRefresh = false){
 
     // ===== EVENTOS (funil) — Supabase. Não bloqueia o dash se falhar. =====
     try {
-      const rowsEv = await fetchEventosSupabase();
+      const rowsEv = await fetchEventosSupabase({ completa: completa });
       EVENTOS = processarEventos(rowsEv);
       marcarFonte('eventos', true);
       if(EVENTOS) console.log('[Eventos] Processado. Horas ativas:', EVENTOS.periodo.horasAtivas);
@@ -10191,7 +10421,7 @@ renderMonthTabs();
   }
 })();
 
-console.log('%c[CIC-G2] build 2026-09-24b — ajuste: as 3 linhas de meta do grafico de vendas por hora deixam de ser acumuladas e viram taxa constante (vendasDia/15, mesma reta em todas as horas), pra comparar direto com a barra do Total que tambem e por-hora — build 2026-09-24 — Home: card de Conversao ganha faixa HOJE | ONTEM (mesma faixa dos 4 cards de Resultado do Bloco 6, com contatoCalc([dia]) pro Em Contato do dia unico) · grafico Variacao de Vendas por Hora: tooltip esconde quem tem 0 vendas naquele horario (Total sempre visivel), e ganha 3 linhas tracejadas de meta Ouro/Prata/Bronze ACUMULADAS nas horas de atuacao (9h-23h=15h), via mtCenariosVendasDia (reusa motor+cache da Meta do Mes/Bloco 7, assincrono, nao trava o grafico, some se o mes nao tem meta) — sem SQL — build 2026-09-21 — Motivos de Perda enxuto: saem as pizzas funil comercial e jornada webinar (ja cobertas pela matriz Motivo x etapa), Top motivos (repetia a pizza geral em barra) e Perda por vendedor (era so volume, nao dizia por que) · entra Motivo de perda por vendedor, mesmo desenho do bloco por origem: card com pizza dos 6 maiores motivos, cauda em Outros, faixa na cor do vendedor, fatia de operacionais no subtitulo · Daniel fora (supervisor) e __OUTROS__ fora, quem saiu do time fica (filtro de data resolve) · Sem proprietario ganha card proprio (138 perdas/3,2%% em set que o filter antigo descartava sem explicar a soma) · rowsCom/rowsWeb/ehWeb/ordemMot/totMot/CORM mantidos (alimentam a matriz Motivo x etapa e a paleta fixa por motivo) · barras() removida, orfa depois das duas remocoes · sem SQL, vw_dash_perda_etapa ja tinha vendedor — build 2026-09-18 — os 3 cenarios saem do index e vao pro banco: meta_mensal ganha a coluna cenario (bronze/prata/ouro, default prata), vw_dash_meta expoe no fim do select · 12 linhas novas set/2026, append-only, vigencia 01/09 (nova planilha do Nirla: ticket sobe em todos os funis, LEAD vira a alavanca de cenario) · META OFICIAL passa a ser o PRATA (R$ 637.560, era Bronze R$ 557.361 -- atingimento cai de 39,8%% pra 34,8%%) · mtMetaVigente/mtMetaCalc ganham parametro cenario, mtRender calcula os 3 mantendo c.meta=prata (Atingimento/Ritmo/matriz/funis inalterados) · mtRenderCenarios le do banco, card Prata com selo "meta oficial" · burn-up com 3 curvas reais (cada uma acumulada do proprio porDia, nao mais escalonamento da curva oficial) · morrem META_OURO/PRATA/BRONZE e as orfas META_MENSAL/DIAS_UTEIS_PADRAO/META_DIARIA/TICKET_META, e o aviso de Bronze desatualizado — build 2026-09-17 — Home, grupo Resultado mais limpo: saem os 4 hm-split de detalhe (Hubla+TMB100, metade TMB+reembolso, qtd reembolso, diferenca de ticket) — so o REEMBOLSO some da Home de fato, os outros 3 continuam nos cards de baixo; hm-split da Conversao fica · linha Hoje vira faixa HOJE | ONTEM nos 4 cards (bruto nao tinha antes), ancorada no rangeDoPeriodo (fuso SP, igual aos botoes do header) em vez da constante HOJE · ignora filtro de DATA, respeita FUNIL · dinheiro/qtd mostram 0, so ticket vira "–" sem venda · SEM delta Hoje x Ontem de proposito (TMB do dia so chega na carga seguinte, delta pintaria vermelho todo dia) — build 2026-09-16 — Onda 2 + ajustes: (0) reembolso por funil CONFERIDO ok, ja usava REEMB_FLAT/vendaKey desde a Onda 1 (item pulado, nao se aplicava) · (1) tarja funilTarja + periodoVazioBanner movidos pra dentro do .content-area (menu lateral fixed cobria o inicio do texto) · (2) tabela Desempenho por vendedor: STATUS sai, %% METAS vira PARTICIPACAO (faturamento/soma da tabela, com barra, fecha 100%% do time) · (3) ONDA 2: registry faturamento/evolucao/times/relatorios/reembolsos passam de onda2 pra sim; evoSerieDiaria/gerarRelatorioSemana/calcStatsSemana/calcStatsMes usam diaAtivo() novo; calcularRecordesPeriodo intocada de proposito; getSemanasFechadasIso sem filtro de proposito (navegacao, nao dado); Reembolsos filtra por .funil e avisa na tela; Evolucao Mensal escreve o funil no titulo — build 2026-09-15b — 4 correcoes pos-Onda 1: (1) FIX matriz Home Dia-a-dia (vendasPorDia/reembPorDia por fora do agregarIntervalo, agora reusam diaPorFunil/REEMB_FLAT) · (2) burn-up: tracejada vira "Bronze - meta oficial", tooltip com os 3 cenarios + Delta cada um via afterBody, Delta do rodape contra Bronze · (3) cards de Cenario Mensal viram barra de %% do realizado (nao seguem o filtro de funil, sao metas da casa) · (4) FIX guarda Desempenho Individual (comparava VENDAS_LISTA so-por-periodo contra porVendedor ja-filtrado-por-funil, acusava divergencia falsa 413x121; agora compara no mesmo funil) · (5) Assistente de dados da aba Relatorios REMOVIDO (matcher sem IA, ia vazar numero de funil sem dizer qual) — build 2026-09-15 — Bloco 3 Onda 1: FUNIL vira dimensao universal do header (popovers Data/Funil substituem os 7 botoes fixos + #monthToggle) · indexarFunis() resolve funil de venda/reembolso 1x por carga (FUNIL_VENDA/REEMB_FLAT/REEMB_POR_FUNIL_DIA) · agregarIntervalo(de,ate,funil) com diaPorFunil() · reembolso segmentado casado por vendaKey com a mesma cascata de identidade da venda (39/40 casados ago+set) · tarja funilTarja + registry SUPORTA_FUNIL (Home/Desemp.Individual/MotivosPerda/CicloVenda=sim, MetaDoMes=parcial, TaxaPassagem=nativo, Discadora/Recordes=nao, resto=onda2) · Desempenho Individual perde filtro local, le o universal · MotivosPerda/CicloVenda segmentam em mpFiltra/cvFiltra · Home segmenta Leads/EC + card Hoje respeita funil · Meta do Mes ganha mtFatia() (Atingimento+Ritmo+burn-up liquido de verdade via REEMB_POR_FUNIL_DIA, opcao A) e some cenarios Prata/Ouro com funil ativo · TP perde barra de data interna redundante · limpeza de barraFiltro/aplicarFiltro/aplicarFiltroHoje/filtroAtalho/renderFunil() morto — build 2026-09-14c — Dashboard desmontada: Variacao de Vendas por Hora vai pra Home (seletor hmDaySelect proprio) · card Hoje vira linha inline nos 3 KPIs da Home (agregarIntervalo(HOJE,HOJE), ignora filtro universal) · Rondas do Dia + Analise por Vendedor + ranking por valorBruto vao pra Desempenho Individual · Cenario Mensal vai pra Meta do Mes com mtRenderCenarios() avisando se Bronze divergir >1%% da meta oficial · Visao Geral/Hoje antigo/Projecao/Evolucao diaria saem · Prata = padrao geral, Bronze = meta oficial (R$ 557.361), Ouro R$ 750.000, dias uteis 21 · burn-up ganha linhas de cenario (curva oficial escalada, fora do tooltip) · botao Dashboard sai da sidebar, setTab() com guarda pra link antigo — build 2026-09-14b — Desempenho Individual: filtro de funil (Disparos LE/Recuperacao MVS/Upsell LE/Webinar CMP/Sem origem/Todos) com Leads/EC/LRT pelo evento (origemLbl) e Vendas/Faturamento/Ticket/Conversao pelo casamento da venda (origemDaVenda+nrOrigemLabel, sem consolidar webinar por pipeline) · Discadora (Tent./Falado/Conect. 1x1) nunca segmenta, badge GERAL · Todos = soma exata dos funis em Vendas/Faturamento mas nao em Leads/EC (unico por lead) · elenco pelo periodo inteiro, nao pelo funil · Media/dia e LRT (mediana por pool) sem escalar pelo funil · rede de seguranca VENDAS_LISTA x porVendedor com banner vdErr — build 2026-09-14 — ABA NOVA "Ciclo de Venda": cobertura/ciclo/reentradas por funil (Disparo/Recuperacao/Upsell/Webinar), 3 materialized views novas (mv_ciclo_leva + mv_ciclo_venda/perda, cascata telefone->email->nome->dobradinha igual ao origemDaVenda(), cobertura 75,9%% venda / 94,5%% perda) — build 2026-09-09 — tooltip que nao abria em 3 graficos (pointRadius:0 sem interaction: mouse so acerta em cima do ponto): burn-up da Meta do Mes (interaction + tooltip Meta/Realizado/Delta colorido + evento no titulo) + Taxa de atendimento + Curva horaria da Discadora (so a linha de interaction) — build 2026-09-04e — Desempenho Individual ganha KPI Media/dia (vendas do periodo / dias do periodo filtrado) no bloco Resultado de cada card, sem SQL — build 2026-09-04d — Luan Alves (agente 19) no time (Callix + cic_vendedor_de_utm) + Thalita/GustavoH saem do time (VENDEDOR_ATE:8, sem venda desde 13/08 e 14/08) + Luan herda a cor da Thalita — build 2026-09-04c — fix da tentativa do 1x1 na Discadora (vw_callix_dash_volume_dia contava manual ATENDIDA como discada; agora usa callix_resumo_1x1_hora, 03/09 18/38,9%% -> 92/7,6%%) + Ana Laura no time (Callix agente 21 + cic_vendedor_de_utm) + fix da chave do Gustavo Henrique + nota do ranking da Discadora cita o Gabriel Poloni pelo nome — build 2026-09-04b — linha de Ticket medio nos funis da matriz (faturamento ÷ vendas do recorte, nao o ticket_liq cadastrado; sem venda mostra – e nao R$ 0) — build 09-04: meta de setembro recalculada COM PASSAGEM lead->Em Contato (700 leads/dia, 540 EC/dia, 39,6 vendas/dia, ticket por funil, R$ 360.234/mes): a conversao passa a incidir sobre o Em Contato e nao sobre a entrada · meta de conversao do TOTAL volta a ser vendas÷EC (7,3%) · mtMetaVigente desempata por criado_em (duas versoes no mesmo dia tinham ordem indefinida) · meta de Em Contato deixa de ser \"–\" e a decomposicao volta a 4 efeitos — build 09-03d: aba vira \"Desempenho Individual\" (titulo no padrao das outras abas, sem o retangulo) · tempo falado em MINUTO e nao em decimo de hora (0,1 h -> 6 min; 15,4 h -> 15h 24) · LRT arredondado sem decimal · badge +N>24h vira tooltip junto com a explicacao do LRT · Ticket Medio · titulos do card em negrito · legenda do rodape do ranking removida — build 09-03c: matriz da Meta do Mes com o TOTAL no TOPO e as quebras por funil em seguida — build 09-03b: ABA NOVA \"Vendedores\": 10 KPIs por vendedor, SEM SQL (Callix do cache _dcRaw, funil e LRT do EVENTOS.flat, vendas do dadosAtivos) · flat.push ganhou `dono` e `hhmm` (unico ponto compartilhado, aditivo, ~3MB) · LRT e MEDIANA pareando a ULTIMA entrada antes do contato (media e 10-40x maior; pareamento ingenuo da tempo negativo) · Conectados 1x1 e ligacao efetiva, nao pessoa unica · faturamento por valorBruto (liquido SEM abater reembolso) · quem nao usa Callix mostra — e nao 0 · supervisor com SUP e conversao – · soma nao bate com a Home porque comercial_mitsuo fica fora (86 vendas / R$ 31.585 em ago) — build 09-03: Leitura com tres recortes num toggle: MES, SEMANA ATUAL e DIA ANTERIOR (dia compara com a meta daquele dia E com a media dos outros dias uteis; fds nao tem meta, entao e superavit) · correcao de escala: os cards por funil da leitura do mes comparavam realizado contra a meta do MES INTEIRO e com 1 dia de 21 davam -R$ 188 mil; agora e pro-rata contra os dias fechados · efeito dominante muito maior que o gap passa a dizer o que compensou — build 09-02f: REVERTE a exclusao do lead sem origem da soma de Leads (o Nirla pegou): contradizia o spec e criava inconsistencia, ja que Vendas e Faturamento sempre incluiram a venda sem funil e a matriz sempre incluiu o lead sem origem — impacto 9 de 723 leads, 1,2% — build 09-02e: FIX: a aba renderizava ANTES dos CSVs chegarem e nada re-renderizava, entao quem abria direto via a tela TODA ZERADA (mtOnPeriodo agora e chamado no fim do renderAll) · meta do mes sob o titulo de cada KPI · dia/semana que ainda nao chegou nao mostra delta (era 0-meta e pintava o mes de vermelho no dia 2) · Sem origem fora da soma de Leads — build 09-02d: conv_pct e SEMPRE Em Contato->Venda (regua da Home/TP): a meta de conversao volta (5/10/10/20%), so a de Em Contato fica \"–\" · Leitura do Mes reescrita: cards coloridos por severidade e cada topico termina num numero que se persegue (falta R$ X/dia util nos N dias, 3,4x o ritmo) em vez de diagnostico · 4 cards so com numero+barra+% da META DO MES · Pacing -> Ritmo do mes · Taxa de Conversao em vez de Conversao EC->venda · bloco Eventos some sem evento cadastrado · fora: frases de secao, nota da matriz e bloco Reguas — build 09-02c: Meta do Mes VALIDADA no ar (6/6 checagens: fat == card liquido da Home com diferenca R$ 0, conversao == Taxa de Passagem 392/9,7%, semana soma fat e vendas mas nao leads/EC, toggle delta conferido) + meta real de setembro (R$ 475.419, 50 vendas/dia, bate exato com a planilha) + SEM meta de Em Contato: a projecao e ENTRADA->VENDA, entao passagem fica NULL e a tela mostra \"–\" em vez de 0 + venda sem casa decimal + coluna de semana em negrito — build 09-02b: fix: ancora do mes usava periodoAtual(), que nao e funcao (a aba abria sempre no mes corrente) -> agora PERIODO.ate; e mtOnPeriodo nao era chamado pelo setPeriodo — build 09-02: ABA NOVA \"Meta do Mes\": meta no Supabase (append-only) e TODO o realizado no JS reusando uniqPorEtapa/origemDaVenda/TMB_LIQUIDO_PCT (view que recalcula realizado = segunda regua) · pacing ate o ultimo dia FECHADO · matriz KPI x dia com toggles Real/Meta/Delta e Dias/So semanas · leads e EC sao DISTINCT no periodo, nunca soma dos dias · TOTAL: Leads = soma dos funis, Em Contato = unico (duas reguas, por decisao) · reembolso como linha propria em Fora dos funis pra bater com o card 2 da Home — build 08-28: Home: grupo Resultado com 7 cards (bruto Hubla+TMB100 = 219.632 · liquido 156.412 com as DUAS subtracoes escritas no subtitulo · ticket bruto 680 e liquido 484 na mesma base de vendas · Hubla agora BRUTA e TMB agora 100%) — o split de 50%% da TMB vem do JS (TMB_LIQUIDO_PCT), NAO da view — build 08-26e: legenda do doughnut BRANCA de verdade: generateLabels custom ignora labels.color, precisa de fontColor no item (senao cai no Chart.defaults.color #666) — build 08-26c: legenda do Ranking operacional vira popover no \"i\" do titulo (hover + foco) — build 08-26b: legenda do doughnut legivel (DCP.text), paleta por motivo com hues separados e validados no fundo navy, taxa do funil em branco — build 08-26: Discadora, bateria visual: scatter em linha inteira com raio pela RAIZ (area proporcional; era linear e a maior bolha cobria 1/3 do grafico) + funil sai do Chart.js e vira HTML SEM EIXO (escala log fazia a venda parecer metade da discada) + perdas viram doughnut com cauda <2% agrupada e URA fora (7 -> 5 fatias) + heatmap com amostra minima de 3 no TMA e teto robusto no p90 (teto 2819s -> 241s, 9 celulas fracas tracejadas) + legenda de escala no heatmap + Leitura rapida removida — build 2026-08-25: ranking da Discadora com 15 colunas (Efet. 1x1 CORRIGIDA: vinha de resumo_1x1.atendidas e mostrava atendida, nao efetiva — Vanessa 241/33,7% virou 82/11,5%) + efetivas_campanha nova (Efet.1x1 + Efet.Camp. = Total Efet.) + %Atend./%Efet. sobre TENTATIVAS TOTAIS + supervisor com traco no CONV. via callix_agente_papel (Aline/Daniel) + venda orfa resolvida NA VIEW pelo callix_agente_vendedor (Pedro Barach 6 -> 7; so fica utm: quem nao tem agente) + agente sem atividade e sem venda fora do ranking e dos graficos — build 2026-08-24e — tentativas 1x1 reais no ar (callix_resumo_1x1_hora + vw_callix_dash_agente_dia com tentativas_1x1_real/efetivas_1x1, backfill 03/08-24/08) — build 08-24d: ranking operacional com Tent./Efet. 1x1 + fix do fallback que inflava Efetivas — heatmap da Discadora com eixo por dia da semana (média por dia) — heatmap da Discadora com métrica TMA (média ponderada) + lista de vendas sem __OUTROS__ + tempo excedido conta como atendida + Felipe/JoaoP/Walisson fora das visualizações — build 08-13: varredura do ciclo: lista de vendas e reembolsos agora acompanham o filtro de período (a lista rotulava pelo MÊS e os dados vinham do PERÍODO) — build 08-12: cache das abas Discadora/Motivos de Perda/Home com validade de 5 min + auto-refresh reativando a aba visível (antes a Callix congelava no 1º carregamento) — build 08-11g Home: "Em Contato" agora usa a régua do CARD DO FUNIL da Taxa de Passagem (uniqBy: pessoa única no período) = 2.855 em ago, e não a da tabela de vendedores (único por vendedor, somado) = 3.320. Conversão = todas as vendas ÷ Em Contato, batendo com o card Vendas. — build 08-11e: leads/conversão agora batem com a Taxa de Passagem (só etapa de ENTRADA + único no período; era 5.009 leads/2,0%, virou 3.281/3,1% em 01-11/08) · legendas dos cards removidas · ticket médio em destaque · matriz reordenada (Leads>Conversão>Vendas>Ticket>Faturamento) c/ Hubla/TMB colapsáveis e negrito em Faturamento/Conversão · grupo "Dinheiro" -> "Funil" — build 08-11d: NOVA ABA HOME (faixa 1: faturamento c/ split Hubla/TMB, vendas+ticket, reembolso qtd/valor/%, conversão geral · faixa 2: taxa de atendimento SEPARADA campanha x 1x1 em destaque · matriz KPI x dia do mês ancorada no mês da data final, coluna sticky + TOTAL, fds sombreado, hoje = parcial) · Discadora: taxa quebrada campanha x 1x1 (KPIs + 2 séries) · SQL: vw_callix_dash_volume_dia +4 colunas, vw_dash_tmb agora filtra utm comercial% (impacto R$ 0,00) · reembolso passa a contar quantidade por dia — Supabase + filtro universal + atribuição unificada (telefone->email->índice + dobradinha tel8+1ºnome) + Reembolsos por período + Discadora (rótulo do KPI, curva horária sem horas mortas) + Funil: etapa 4 casa Link OU Forecast nas DUAS réguas (etapaOrdinal + nrIsLink) + NOVA ABA Motivos de Perda (perda por etapa/origem, webinar separado, pizzas por motivo) · menu Funil & Taxa de Passagem removido · Discadora: ranking largo com Total/%Camp./%1x1/Atend./Conv., discado quebrado, datas DD/MM','color:#335FEB;font-weight:700');
+console.log('%c[CIC-G2] build 2026-09-24c: upgrade de egress (eventos incremental por id com trava de contagem, IndexedDB 7 dias, views de venda por assinatura md5 via RPC cic_assinatura_fontes, cache de MV ate HH:09/HH:18, pausa por ociosidade 15 min, Shift+clique = recarga completa), sem mudar numero — build 2026-09-24b — ajuste: as 3 linhas de meta do grafico de vendas por hora deixam de ser acumuladas e viram taxa constante (vendasDia/15, mesma reta em todas as horas), pra comparar direto com a barra do Total que tambem e por-hora — build 2026-09-24 — Home: card de Conversao ganha faixa HOJE | ONTEM (mesma faixa dos 4 cards de Resultado do Bloco 6, com contatoCalc([dia]) pro Em Contato do dia unico) · grafico Variacao de Vendas por Hora: tooltip esconde quem tem 0 vendas naquele horario (Total sempre visivel), e ganha 3 linhas tracejadas de meta Ouro/Prata/Bronze ACUMULADAS nas horas de atuacao (9h-23h=15h), via mtCenariosVendasDia (reusa motor+cache da Meta do Mes/Bloco 7, assincrono, nao trava o grafico, some se o mes nao tem meta) — sem SQL — build 2026-09-21 — Motivos de Perda enxuto: saem as pizzas funil comercial e jornada webinar (ja cobertas pela matriz Motivo x etapa), Top motivos (repetia a pizza geral em barra) e Perda por vendedor (era so volume, nao dizia por que) · entra Motivo de perda por vendedor, mesmo desenho do bloco por origem: card com pizza dos 6 maiores motivos, cauda em Outros, faixa na cor do vendedor, fatia de operacionais no subtitulo · Daniel fora (supervisor) e __OUTROS__ fora, quem saiu do time fica (filtro de data resolve) · Sem proprietario ganha card proprio (138 perdas/3,2%% em set que o filter antigo descartava sem explicar a soma) · rowsCom/rowsWeb/ehWeb/ordemMot/totMot/CORM mantidos (alimentam a matriz Motivo x etapa e a paleta fixa por motivo) · barras() removida, orfa depois das duas remocoes · sem SQL, vw_dash_perda_etapa ja tinha vendedor — build 2026-09-18 — os 3 cenarios saem do index e vao pro banco: meta_mensal ganha a coluna cenario (bronze/prata/ouro, default prata), vw_dash_meta expoe no fim do select · 12 linhas novas set/2026, append-only, vigencia 01/09 (nova planilha do Nirla: ticket sobe em todos os funis, LEAD vira a alavanca de cenario) · META OFICIAL passa a ser o PRATA (R$ 637.560, era Bronze R$ 557.361 -- atingimento cai de 39,8%% pra 34,8%%) · mtMetaVigente/mtMetaCalc ganham parametro cenario, mtRender calcula os 3 mantendo c.meta=prata (Atingimento/Ritmo/matriz/funis inalterados) · mtRenderCenarios le do banco, card Prata com selo "meta oficial" · burn-up com 3 curvas reais (cada uma acumulada do proprio porDia, nao mais escalonamento da curva oficial) · morrem META_OURO/PRATA/BRONZE e as orfas META_MENSAL/DIAS_UTEIS_PADRAO/META_DIARIA/TICKET_META, e o aviso de Bronze desatualizado — build 2026-09-17 — Home, grupo Resultado mais limpo: saem os 4 hm-split de detalhe (Hubla+TMB100, metade TMB+reembolso, qtd reembolso, diferenca de ticket) — so o REEMBOLSO some da Home de fato, os outros 3 continuam nos cards de baixo; hm-split da Conversao fica · linha Hoje vira faixa HOJE | ONTEM nos 4 cards (bruto nao tinha antes), ancorada no rangeDoPeriodo (fuso SP, igual aos botoes do header) em vez da constante HOJE · ignora filtro de DATA, respeita FUNIL · dinheiro/qtd mostram 0, so ticket vira "–" sem venda · SEM delta Hoje x Ontem de proposito (TMB do dia so chega na carga seguinte, delta pintaria vermelho todo dia) — build 2026-09-16 — Onda 2 + ajustes: (0) reembolso por funil CONFERIDO ok, ja usava REEMB_FLAT/vendaKey desde a Onda 1 (item pulado, nao se aplicava) · (1) tarja funilTarja + periodoVazioBanner movidos pra dentro do .content-area (menu lateral fixed cobria o inicio do texto) · (2) tabela Desempenho por vendedor: STATUS sai, %% METAS vira PARTICIPACAO (faturamento/soma da tabela, com barra, fecha 100%% do time) · (3) ONDA 2: registry faturamento/evolucao/times/relatorios/reembolsos passam de onda2 pra sim; evoSerieDiaria/gerarRelatorioSemana/calcStatsSemana/calcStatsMes usam diaAtivo() novo; calcularRecordesPeriodo intocada de proposito; getSemanasFechadasIso sem filtro de proposito (navegacao, nao dado); Reembolsos filtra por .funil e avisa na tela; Evolucao Mensal escreve o funil no titulo — build 2026-09-15b — 4 correcoes pos-Onda 1: (1) FIX matriz Home Dia-a-dia (vendasPorDia/reembPorDia por fora do agregarIntervalo, agora reusam diaPorFunil/REEMB_FLAT) · (2) burn-up: tracejada vira "Bronze - meta oficial", tooltip com os 3 cenarios + Delta cada um via afterBody, Delta do rodape contra Bronze · (3) cards de Cenario Mensal viram barra de %% do realizado (nao seguem o filtro de funil, sao metas da casa) · (4) FIX guarda Desempenho Individual (comparava VENDAS_LISTA so-por-periodo contra porVendedor ja-filtrado-por-funil, acusava divergencia falsa 413x121; agora compara no mesmo funil) · (5) Assistente de dados da aba Relatorios REMOVIDO (matcher sem IA, ia vazar numero de funil sem dizer qual) — build 2026-09-15 — Bloco 3 Onda 1: FUNIL vira dimensao universal do header (popovers Data/Funil substituem os 7 botoes fixos + #monthToggle) · indexarFunis() resolve funil de venda/reembolso 1x por carga (FUNIL_VENDA/REEMB_FLAT/REEMB_POR_FUNIL_DIA) · agregarIntervalo(de,ate,funil) com diaPorFunil() · reembolso segmentado casado por vendaKey com a mesma cascata de identidade da venda (39/40 casados ago+set) · tarja funilTarja + registry SUPORTA_FUNIL (Home/Desemp.Individual/MotivosPerda/CicloVenda=sim, MetaDoMes=parcial, TaxaPassagem=nativo, Discadora/Recordes=nao, resto=onda2) · Desempenho Individual perde filtro local, le o universal · MotivosPerda/CicloVenda segmentam em mpFiltra/cvFiltra · Home segmenta Leads/EC + card Hoje respeita funil · Meta do Mes ganha mtFatia() (Atingimento+Ritmo+burn-up liquido de verdade via REEMB_POR_FUNIL_DIA, opcao A) e some cenarios Prata/Ouro com funil ativo · TP perde barra de data interna redundante · limpeza de barraFiltro/aplicarFiltro/aplicarFiltroHoje/filtroAtalho/renderFunil() morto — build 2026-09-14c — Dashboard desmontada: Variacao de Vendas por Hora vai pra Home (seletor hmDaySelect proprio) · card Hoje vira linha inline nos 3 KPIs da Home (agregarIntervalo(HOJE,HOJE), ignora filtro universal) · Rondas do Dia + Analise por Vendedor + ranking por valorBruto vao pra Desempenho Individual · Cenario Mensal vai pra Meta do Mes com mtRenderCenarios() avisando se Bronze divergir >1%% da meta oficial · Visao Geral/Hoje antigo/Projecao/Evolucao diaria saem · Prata = padrao geral, Bronze = meta oficial (R$ 557.361), Ouro R$ 750.000, dias uteis 21 · burn-up ganha linhas de cenario (curva oficial escalada, fora do tooltip) · botao Dashboard sai da sidebar, setTab() com guarda pra link antigo — build 2026-09-14b — Desempenho Individual: filtro de funil (Disparos LE/Recuperacao MVS/Upsell LE/Webinar CMP/Sem origem/Todos) com Leads/EC/LRT pelo evento (origemLbl) e Vendas/Faturamento/Ticket/Conversao pelo casamento da venda (origemDaVenda+nrOrigemLabel, sem consolidar webinar por pipeline) · Discadora (Tent./Falado/Conect. 1x1) nunca segmenta, badge GERAL · Todos = soma exata dos funis em Vendas/Faturamento mas nao em Leads/EC (unico por lead) · elenco pelo periodo inteiro, nao pelo funil · Media/dia e LRT (mediana por pool) sem escalar pelo funil · rede de seguranca VENDAS_LISTA x porVendedor com banner vdErr — build 2026-09-14 — ABA NOVA "Ciclo de Venda": cobertura/ciclo/reentradas por funil (Disparo/Recuperacao/Upsell/Webinar), 3 materialized views novas (mv_ciclo_leva + mv_ciclo_venda/perda, cascata telefone->email->nome->dobradinha igual ao origemDaVenda(), cobertura 75,9%% venda / 94,5%% perda) — build 2026-09-09 — tooltip que nao abria em 3 graficos (pointRadius:0 sem interaction: mouse so acerta em cima do ponto): burn-up da Meta do Mes (interaction + tooltip Meta/Realizado/Delta colorido + evento no titulo) + Taxa de atendimento + Curva horaria da Discadora (so a linha de interaction) — build 2026-09-04e — Desempenho Individual ganha KPI Media/dia (vendas do periodo / dias do periodo filtrado) no bloco Resultado de cada card, sem SQL — build 2026-09-04d — Luan Alves (agente 19) no time (Callix + cic_vendedor_de_utm) + Thalita/GustavoH saem do time (VENDEDOR_ATE:8, sem venda desde 13/08 e 14/08) + Luan herda a cor da Thalita — build 2026-09-04c — fix da tentativa do 1x1 na Discadora (vw_callix_dash_volume_dia contava manual ATENDIDA como discada; agora usa callix_resumo_1x1_hora, 03/09 18/38,9%% -> 92/7,6%%) + Ana Laura no time (Callix agente 21 + cic_vendedor_de_utm) + fix da chave do Gustavo Henrique + nota do ranking da Discadora cita o Gabriel Poloni pelo nome — build 2026-09-04b — linha de Ticket medio nos funis da matriz (faturamento ÷ vendas do recorte, nao o ticket_liq cadastrado; sem venda mostra – e nao R$ 0) — build 09-04: meta de setembro recalculada COM PASSAGEM lead->Em Contato (700 leads/dia, 540 EC/dia, 39,6 vendas/dia, ticket por funil, R$ 360.234/mes): a conversao passa a incidir sobre o Em Contato e nao sobre a entrada · meta de conversao do TOTAL volta a ser vendas÷EC (7,3%) · mtMetaVigente desempata por criado_em (duas versoes no mesmo dia tinham ordem indefinida) · meta de Em Contato deixa de ser \"–\" e a decomposicao volta a 4 efeitos — build 09-03d: aba vira \"Desempenho Individual\" (titulo no padrao das outras abas, sem o retangulo) · tempo falado em MINUTO e nao em decimo de hora (0,1 h -> 6 min; 15,4 h -> 15h 24) · LRT arredondado sem decimal · badge +N>24h vira tooltip junto com a explicacao do LRT · Ticket Medio · titulos do card em negrito · legenda do rodape do ranking removida — build 09-03c: matriz da Meta do Mes com o TOTAL no TOPO e as quebras por funil em seguida — build 09-03b: ABA NOVA \"Vendedores\": 10 KPIs por vendedor, SEM SQL (Callix do cache _dcRaw, funil e LRT do EVENTOS.flat, vendas do dadosAtivos) · flat.push ganhou `dono` e `hhmm` (unico ponto compartilhado, aditivo, ~3MB) · LRT e MEDIANA pareando a ULTIMA entrada antes do contato (media e 10-40x maior; pareamento ingenuo da tempo negativo) · Conectados 1x1 e ligacao efetiva, nao pessoa unica · faturamento por valorBruto (liquido SEM abater reembolso) · quem nao usa Callix mostra — e nao 0 · supervisor com SUP e conversao – · soma nao bate com a Home porque comercial_mitsuo fica fora (86 vendas / R$ 31.585 em ago) — build 09-03: Leitura com tres recortes num toggle: MES, SEMANA ATUAL e DIA ANTERIOR (dia compara com a meta daquele dia E com a media dos outros dias uteis; fds nao tem meta, entao e superavit) · correcao de escala: os cards por funil da leitura do mes comparavam realizado contra a meta do MES INTEIRO e com 1 dia de 21 davam -R$ 188 mil; agora e pro-rata contra os dias fechados · efeito dominante muito maior que o gap passa a dizer o que compensou — build 09-02f: REVERTE a exclusao do lead sem origem da soma de Leads (o Nirla pegou): contradizia o spec e criava inconsistencia, ja que Vendas e Faturamento sempre incluiram a venda sem funil e a matriz sempre incluiu o lead sem origem — impacto 9 de 723 leads, 1,2% — build 09-02e: FIX: a aba renderizava ANTES dos CSVs chegarem e nada re-renderizava, entao quem abria direto via a tela TODA ZERADA (mtOnPeriodo agora e chamado no fim do renderAll) · meta do mes sob o titulo de cada KPI · dia/semana que ainda nao chegou nao mostra delta (era 0-meta e pintava o mes de vermelho no dia 2) · Sem origem fora da soma de Leads — build 09-02d: conv_pct e SEMPRE Em Contato->Venda (regua da Home/TP): a meta de conversao volta (5/10/10/20%), so a de Em Contato fica \"–\" · Leitura do Mes reescrita: cards coloridos por severidade e cada topico termina num numero que se persegue (falta R$ X/dia util nos N dias, 3,4x o ritmo) em vez de diagnostico · 4 cards so com numero+barra+% da META DO MES · Pacing -> Ritmo do mes · Taxa de Conversao em vez de Conversao EC->venda · bloco Eventos some sem evento cadastrado · fora: frases de secao, nota da matriz e bloco Reguas — build 09-02c: Meta do Mes VALIDADA no ar (6/6 checagens: fat == card liquido da Home com diferenca R$ 0, conversao == Taxa de Passagem 392/9,7%, semana soma fat e vendas mas nao leads/EC, toggle delta conferido) + meta real de setembro (R$ 475.419, 50 vendas/dia, bate exato com a planilha) + SEM meta de Em Contato: a projecao e ENTRADA->VENDA, entao passagem fica NULL e a tela mostra \"–\" em vez de 0 + venda sem casa decimal + coluna de semana em negrito — build 09-02b: fix: ancora do mes usava periodoAtual(), que nao e funcao (a aba abria sempre no mes corrente) -> agora PERIODO.ate; e mtOnPeriodo nao era chamado pelo setPeriodo — build 09-02: ABA NOVA \"Meta do Mes\": meta no Supabase (append-only) e TODO o realizado no JS reusando uniqPorEtapa/origemDaVenda/TMB_LIQUIDO_PCT (view que recalcula realizado = segunda regua) · pacing ate o ultimo dia FECHADO · matriz KPI x dia com toggles Real/Meta/Delta e Dias/So semanas · leads e EC sao DISTINCT no periodo, nunca soma dos dias · TOTAL: Leads = soma dos funis, Em Contato = unico (duas reguas, por decisao) · reembolso como linha propria em Fora dos funis pra bater com o card 2 da Home — build 08-28: Home: grupo Resultado com 7 cards (bruto Hubla+TMB100 = 219.632 · liquido 156.412 com as DUAS subtracoes escritas no subtitulo · ticket bruto 680 e liquido 484 na mesma base de vendas · Hubla agora BRUTA e TMB agora 100%) — o split de 50%% da TMB vem do JS (TMB_LIQUIDO_PCT), NAO da view — build 08-26e: legenda do doughnut BRANCA de verdade: generateLabels custom ignora labels.color, precisa de fontColor no item (senao cai no Chart.defaults.color #666) — build 08-26c: legenda do Ranking operacional vira popover no \"i\" do titulo (hover + foco) — build 08-26b: legenda do doughnut legivel (DCP.text), paleta por motivo com hues separados e validados no fundo navy, taxa do funil em branco — build 08-26: Discadora, bateria visual: scatter em linha inteira com raio pela RAIZ (area proporcional; era linear e a maior bolha cobria 1/3 do grafico) + funil sai do Chart.js e vira HTML SEM EIXO (escala log fazia a venda parecer metade da discada) + perdas viram doughnut com cauda <2% agrupada e URA fora (7 -> 5 fatias) + heatmap com amostra minima de 3 no TMA e teto robusto no p90 (teto 2819s -> 241s, 9 celulas fracas tracejadas) + legenda de escala no heatmap + Leitura rapida removida — build 2026-08-25: ranking da Discadora com 15 colunas (Efet. 1x1 CORRIGIDA: vinha de resumo_1x1.atendidas e mostrava atendida, nao efetiva — Vanessa 241/33,7% virou 82/11,5%) + efetivas_campanha nova (Efet.1x1 + Efet.Camp. = Total Efet.) + %Atend./%Efet. sobre TENTATIVAS TOTAIS + supervisor com traco no CONV. via callix_agente_papel (Aline/Daniel) + venda orfa resolvida NA VIEW pelo callix_agente_vendedor (Pedro Barach 6 -> 7; so fica utm: quem nao tem agente) + agente sem atividade e sem venda fora do ranking e dos graficos — build 2026-08-24e — tentativas 1x1 reais no ar (callix_resumo_1x1_hora + vw_callix_dash_agente_dia com tentativas_1x1_real/efetivas_1x1, backfill 03/08-24/08) — build 08-24d: ranking operacional com Tent./Efet. 1x1 + fix do fallback que inflava Efetivas — heatmap da Discadora com eixo por dia da semana (média por dia) — heatmap da Discadora com métrica TMA (média ponderada) + lista de vendas sem __OUTROS__ + tempo excedido conta como atendida + Felipe/JoaoP/Walisson fora das visualizações — build 08-13: varredura do ciclo: lista de vendas e reembolsos agora acompanham o filtro de período (a lista rotulava pelo MÊS e os dados vinham do PERÍODO) — build 08-12: cache das abas Discadora/Motivos de Perda/Home com validade de 5 min + auto-refresh reativando a aba visível (antes a Callix congelava no 1º carregamento) — build 08-11g Home: "Em Contato" agora usa a régua do CARD DO FUNIL da Taxa de Passagem (uniqBy: pessoa única no período) = 2.855 em ago, e não a da tabela de vendedores (único por vendedor, somado) = 3.320. Conversão = todas as vendas ÷ Em Contato, batendo com o card Vendas. — build 08-11e: leads/conversão agora batem com a Taxa de Passagem (só etapa de ENTRADA + único no período; era 5.009 leads/2,0%, virou 3.281/3,1% em 01-11/08) · legendas dos cards removidas · ticket médio em destaque · matriz reordenada (Leads>Conversão>Vendas>Ticket>Faturamento) c/ Hubla/TMB colapsáveis e negrito em Faturamento/Conversão · grupo "Dinheiro" -> "Funil" — build 08-11d: NOVA ABA HOME (faixa 1: faturamento c/ split Hubla/TMB, vendas+ticket, reembolso qtd/valor/%, conversão geral · faixa 2: taxa de atendimento SEPARADA campanha x 1x1 em destaque · matriz KPI x dia do mês ancorada no mês da data final, coluna sticky + TOTAL, fds sombreado, hoje = parcial) · Discadora: taxa quebrada campanha x 1x1 (KPIs + 2 séries) · SQL: vw_callix_dash_volume_dia +4 colunas, vw_dash_tmb agora filtra utm comercial% (impacto R$ 0,00) · reembolso passa a contar quantidade por dia — Supabase + filtro universal + atribuição unificada (telefone->email->índice + dobradinha tel8+1ºnome) + Reembolsos por período + Discadora (rótulo do KPI, curva horária sem horas mortas) + Funil: etapa 4 casa Link OU Forecast nas DUAS réguas (etapaOrdinal + nrIsLink) + NOVA ABA Motivos de Perda (perda por etapa/origem, webinar separado, pizzas por motivo) · menu Funil & Taxa de Passagem removido · Discadora: ranking largo com Total/%Camp./%1x1/Atend./Conv., discado quebrado, datas DD/MM','color:#335FEB;font-weight:700');
 
 // Iniciar aba a partir da URL
 const urlParams = new URLSearchParams(window.location.search);
@@ -10226,19 +10456,65 @@ window.cicRecarregarAbaAtiva = function(){
 };
 let __ultimoLoad = Date.now();
 const __origCarregar = carregarDados;
-carregarDados = function(f){ __ultimoLoad = Date.now(); return __origCarregar(f); };
+carregarDados = function(o){ __ultimoLoad = Date.now(); return __origCarregar(o); };
+
+// ===== Ociosidade: pausa o auto-refresh após 15 min sem interação (build 09-24c, upgrade egress) =====
+// Aba visível e ociosa (monitor ligado, pessoa fora) baixava o dia todo. Qualquer atividade retoma
+// e, se o último load tiver mais de 5 min, atualiza na hora (modo incremental, barato).
+window.CIC_IDLE_MS = 15 * 60 * 1000;
+let __ultimaAtividade = Date.now();
+let __pausadoPorOcio = false;
+function cicStatusPausa(pausado){
+  var st = document.getElementById('updateStatus'); if(!st) return;
+  var t = document.getElementById('updateTime'); var hora = t ? t.textContent : '--:--';
+  if(pausado) st.innerHTML = 'Pausado (inativo) · Atualizado às <span id="updateTime">' + hora + '</span>';
+  else if(/^Pausado/.test(st.textContent)) st.innerHTML = 'Atualizado às <span id="updateTime">' + hora + '</span>';
+}
+['mousemove','keydown','click','scroll','touchstart','wheel'].forEach(ev =>
+  window.addEventListener(ev, () => {
+    __ultimaAtividade = Date.now();
+    if(__pausadoPorOcio){
+      __pausadoPorOcio = false;
+      cicStatusPausa(false);
+      if(Date.now() - __ultimoLoad > 300000){ carregarDados({ completa: false }); window.cicRecarregarAbaAtiva(); }
+    }
+  }, { passive: true, capture: true })
+);
 setInterval(() => {
   if(document.hidden) return;                          // só atualiza aba visível
-  carregarDados(true);
+  if(Date.now() - __ultimaAtividade > window.CIC_IDLE_MS){
+    if(!__pausadoPorOcio){ __pausadoPorOcio = true; cicStatusPausa(true); console.log('[Dashboard] auto-refresh pausado por ociosidade'); }
+    return;
+  }
+  carregarDados({ completa: false });                  // incremental
   window.cicRecarregarAbaAtiva();
 }, 300000);                                            // 5 minutos
 document.addEventListener('visibilitychange', () => {
-  // Ao voltar a ficar visível, atualiza (se passou >60s desde o último load).
+  // Ao voltar a ficar visível, atualiza (se passou >60s desde o último load). Incremental, não completa.
   if(!document.hidden && (Date.now() - __ultimoLoad) > 60000){
-    carregarDados(true);
+    carregarDados({ completa: false });
     window.cicRecarregarAbaAtiva();
   }
 });
+// ===== Botão Atualizar (5.6): clique = incremental · Shift+clique = recarga completa de tudo =====
+// Shift zera eventos, vendas/TMB/reembolso, Motivos de Perda e Ciclo (memória + IndexedDB).
+// Discadora e Meta do Mês seguem com o TTL de 5 min delas.
+window.cicAtualizarClique = function(ev){
+  if(ev && ev.shiftKey){
+    console.log('[Dashboard] Shift+clique: recarga COMPLETA (ignora cache e IndexedDB)');
+    window.CIC_FORCADO_EM = Date.now();
+    EV_ESTADO = null;
+    Object.keys(CIC_VIEW_CACHE).forEach(function(k){ delete CIC_VIEW_CACHE[k]; });
+    REEMBOLSOS_AT = 0;
+    cicIdbLimparTudo().then(function(){
+      carregarDados({ completa: true });
+      window.cicRecarregarAbaAtiva();
+    });
+    return;
+  }
+  carregarDados({ completa: false });
+  window.cicRecarregarAbaAtiva();
+};
 </script>
 <script>
 /* ===== Aba Discadora (Callix) — data-driven, lê as views vw_callix_dash_* ===== */
@@ -10910,13 +11186,15 @@ document.addEventListener('visibilitychange', () => {
 
   window.carregarMotivosPerda = function(){
     // Mesmo caso da Discadora: sem prazo, a aba servia o primeiro retrato pra sempre.
-    if(MP.carregado && window.cicCacheFresco && window.cicCacheFresco(MP.at)){ mpRender(); return; }
+    // (build 09-24c) view sobre materialized view: vale até o próximo HH:09 (cron no :07).
+    if(MP.carregado && window.cicMvFresco(MP.at, 9)){ mpRender(); return; }
     if(MP.carregando) return;
     MP.carregando = true;
     var ld = document.getElementById('mp-loading'), er = document.getElementById('mp-err');
     if(er) er.textContent = '';
     if(ld) ld.style.display = '';
-    fetchViewCsvSupabase('vw_dash_perda_etapa').then(function(csv){
+    window.cicMvCsv('perda_etapa', 'vw_dash_perda_etapa', 9).then(function(res){
+      var csv = res.csv, atDado = res.at;
       var linhas = parseCSV(csv);
       if(!linhas.length){ throw new Error('view vazia'); }
       var head = linhas[0].map(function(h){ return String(h).trim(); });
@@ -10925,7 +11203,7 @@ document.addEventListener('visibilitychange', () => {
         o.etapa_ord = parseInt(o.etapa_ord,10) || 0;
         return o;
       });
-      MP.carregado = true; MP.carregando = false; MP.at = Date.now();
+      MP.carregado = true; MP.carregando = false; MP.at = atDado;
       if(ld) ld.style.display = 'none';
       mpRender();
     }).catch(function(e){
@@ -11137,7 +11415,8 @@ document.addEventListener('visibilitychange', () => {
   window.cvOnPeriodo = function(){ if(CV.carregado) cvRender(); };
 
   window.carregarCicloVenda = function(){
-    if(CV.carregado && window.cicCacheFresco && window.cicCacheFresco(CV.at)){ cvRender(); return; }
+    // (build 09-24c) views sobre materialized view: valem até o próximo HH:18 (cadeia :12/:14/:16).
+    if(CV.carregado && window.cicMvFresco(CV.at, 18)){ cvRender(); return; }
     if(CV.carregando) return;
     CV.carregando = true;
     var ld = document.getElementById('cv-loading'), er = document.getElementById('cv-err');
@@ -11156,13 +11435,14 @@ document.addEventListener('visibilitychange', () => {
       });
     }
     Promise.all([
-      fetchViewCsvSupabase('vw_dash_ciclo_venda'),
-      fetchViewCsvSupabase('vw_dash_ciclo_perda')
+      window.cicMvCsv('ciclo_venda', 'vw_dash_ciclo_venda', 18),
+      window.cicMvCsv('ciclo_perda', 'vw_dash_ciclo_perda', 18)
     ]).then(function(res){
-      CV.vendas = parse(res[0]);
-      CV.perdas = parse(res[1]);
+      CV.vendas = parse(res[0].csv);
+      CV.perdas = parse(res[1].csv);
+      var atDado = Math.min(res[0].at, res[1].at);
       if(!CV.vendas.length && !CV.perdas.length){ throw new Error('views vazias'); }
-      CV.carregado = true; CV.carregando = false; CV.at = Date.now();
+      CV.carregado = true; CV.carregando = false; CV.at = atDado;
       if(ld) ld.style.display = 'none';
       cvRender();
     }).catch(function(e){
